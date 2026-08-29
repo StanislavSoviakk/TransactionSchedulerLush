@@ -1,0 +1,3 @@
+Domain layer:
+The supplied market configuration defines a single IANA timezone per market. The implementation follows that configuration.
+If a market spans multiple timezones in production, timezone should become part of shop configuration rather than being derived from the market.
