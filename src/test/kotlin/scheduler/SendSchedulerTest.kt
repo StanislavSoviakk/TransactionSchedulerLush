@@ -10,6 +10,7 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 class SendSchedulerTest {
 
@@ -22,7 +23,12 @@ class SendSchedulerTest {
         market = market,
         shopId = "shop-1",
         shopSubdivision = shopSubdivision,
-        localTimestamp = localTimestamp
+        localTimestamp = localTimestamp,
+        amount = java.math.BigDecimal("10.00"),
+        currency = "EUR",
+        paymentMethod = "CARD",
+        paymentRef = "ref-1",
+        fiscalSeq = null
     )
 
     private fun schedulerWithHolidays(vararg holidays: Holiday) =
@@ -33,7 +39,7 @@ class SendSchedulerTest {
     @Test
     fun `transaction recorded before the window uses the same day's window`() {
         val scheduler = schedulerWithHolidays()
-        // 00:30 local is before that same day's 01:00-02:00 window, so no roll-over is needed.
+        // 00:30 is before the window that same day, no roll-over needed
         val txn = transaction(Market.DEU, LocalDateTime.parse("2026-06-11T00:30:00"))
 
         val window = scheduler.findNextSendWindow(txn, now = Instant.parse("2026-06-10T00:00:00Z"))
@@ -54,7 +60,7 @@ class SendSchedulerTest {
 
     @Test
     fun `transaction recorded exactly at window end rolls over to the next day`() {
-        // 02:00 is treated as already closed (half-open interval [01:00, 02:00)).
+        // 02:00 counts as already closed - window is [01:00, 02:00)
         val scheduler = schedulerWithHolidays()
         val txn = transaction(Market.DEU, LocalDateTime.parse("2026-06-11T02:00:00"))
 
@@ -69,7 +75,7 @@ class SendSchedulerTest {
     @Test
     fun `already closed window relative to trusted now is never returned`() {
         val scheduler = schedulerWithHolidays()
-        // Recorded early, but the trusted clock says the window for that day is already over.
+        // recorded early, but real time says today's window already passed
         val txn = transaction(Market.DEU, LocalDateTime.parse("2026-06-10T18:00:00"))
 
         val window = scheduler.findNextSendWindow(txn, now = Instant.parse("2026-06-11T10:00:00Z"))
@@ -78,10 +84,22 @@ class SendSchedulerTest {
     }
 
     @Test
+    fun `trusted now exactly at window end means today's window is already closed`() {
+        val scheduler = schedulerWithHolidays()
+        val txn = transaction(Market.DEU, LocalDateTime.parse("2026-06-10T18:00:00"))
+        // now is 02:00 CEST on the dot - window is [01:00, 02:00), so this is already closed
+        val now = Instant.parse("2026-06-11T00:00:00Z")
+
+        val window = scheduler.findNextSendWindow(txn, now = now)
+
+        assertEquals(Instant.parse("2026-06-11T23:00:00Z"), window.start) // rolls to tomorrow
+    }
+
+    @Test
     fun `current time inside a valid window is returned instead of skipping ahead`() {
         val scheduler = schedulerWithHolidays()
         val txn = transaction(Market.DEU, LocalDateTime.parse("2026-06-10T18:00:00"))
-        // now is 01:30 CEST on 2026-06-11, i.e. inside that day's send window.
+        // now is 01:30 CEST, inside today's window
         val now = Instant.parse("2026-06-10T23:30:00Z")
 
         val window = scheduler.findNextSendWindow(txn, now = now)
@@ -92,8 +110,7 @@ class SendSchedulerTest {
 
     @Test
     fun `till clock recorded far ahead of trusted now is not corrected`() {
-        // The till clock is unreliable - if it recorded a future-looking timestamp,
-        // the scheduler must still honor it as a lower bound rather than "fixing" it.
+        // till says the future, we don't second-guess it
         val scheduler = schedulerWithHolidays()
         val txn = transaction(Market.DEU, LocalDateTime.parse("2026-06-20T10:00:00"))
 
@@ -129,7 +146,7 @@ class SendSchedulerTest {
         val window = schedulerWithHolidays(holiday)
             .findNextSendWindow(txn, now = Instant.parse("2026-06-10T00:00:00Z"))
 
-        // Shop is in Berlin (BE), holiday only applies to Bavaria (BY) -> not skipped.
+        // shop is in Berlin, holiday is Bavaria-only -> not skipped
         assertEquals(Instant.parse("2026-06-10T23:00:00Z"), window.start)
     }
 
@@ -151,8 +168,7 @@ class SendSchedulerTest {
 
     @Test
     fun `holiday run spanning the year boundary skips every day in the run`() {
-        // Also proves consecutive-holiday skipping: two holidays in a row,
-        // straddling Dec 31 / Jan 1, must both be skipped in one pass.
+        // also covers two holidays in a row across the year boundary
         val scheduler = schedulerWithHolidays(
             Holiday(LocalDate.parse("2026-12-31"), "DE", true, emptySet()),
             Holiday(LocalDate.parse("2027-01-01"), "DE", true, emptySet())
@@ -166,14 +182,11 @@ class SendSchedulerTest {
 
     @Test
     fun `holiday on the day whose window is currently open is still skipped`() {
-        // The scheduler must re-check the holiday calendar even when `now` already
-        // falls inside the candidate window - a shortcut that returns "now's window"
-        // without re-validating it would silently violate "shops don't send on holidays".
+        // "now" looks like it's inside the window, but that day is a holiday
         val scheduler = schedulerWithHolidays(
             Holiday(LocalDate.parse("2026-06-11"), "DE", true, emptySet())
         )
         val txn = transaction(Market.DEU, LocalDateTime.parse("2026-06-10T18:00:00"))
-        // now is 01:30 CEST on 2026-06-11 - nominally inside that day's window, but that day is a holiday.
         val now = Instant.parse("2026-06-10T23:30:00Z")
 
         val window = scheduler.findNextSendWindow(txn, now = now)
@@ -183,9 +196,7 @@ class SendSchedulerTest {
 
     @Test
     fun `regional holiday never applies when the shop's subdivision is unknown`() {
-        // Dirty CSV rows can have a blank shop_subdivision. A regional (non-global)
-        // holiday must not be treated as "applies everywhere" in that case - only
-        // national holidays protect a shop with no known subdivision.
+        // no subdivision on file -> regional holidays can't match, only national ones do
         val holiday = Holiday(
             date = LocalDate.parse("2026-06-11"),
             countryCode = "DE",
@@ -205,9 +216,7 @@ class SendSchedulerTest {
 
     @Test
     fun `spring-forward transition produces correct absolute instants`() {
-        // Europe/Berlin jumps 02:00 -> 03:00 on 2026-03-29; the window's nominal
-        // 01:00-02:00 end lands exactly in the gap. java.time must resolve this,
-        // not a hand-rolled offset calculation.
+        // Berlin jumps 02:00 -> 03:00 on this date, right at the window's end
         val scheduler = schedulerWithHolidays()
         val txn = transaction(Market.DEU, LocalDateTime.parse("2026-03-28T18:00:00"))
 
@@ -227,4 +236,85 @@ class SendSchedulerTest {
         assertEquals(Instant.parse("2026-06-10T16:00:00Z"), window.start) // 01:00 JST, always +09:00
         assertEquals(Instant.parse("2026-06-10T17:00:00Z"), window.end)
     }
+
+    @Test
+    fun `southern-hemisphere fall-back transition leaves the window unaffected`() {
+        // Auckland's fall-back happens at 03:00, after the window, so this day is fine
+        val scheduler = schedulerWithHolidays()
+        val txn = transaction(Market.NZL, LocalDateTime.parse("2026-04-04T10:00:00"))
+
+        val window = scheduler.findNextSendWindow(txn, now = Instant.parse("2026-04-04T00:00:00Z"))
+
+        assertEquals(Instant.parse("2026-04-04T12:00:00Z"), window.start) // 01:00 NZDT (+13:00)
+        assertEquals(Instant.parse("2026-04-04T13:00:00Z"), window.end)   // 02:00 NZDT (+13:00)
+    }
+
+    @Test
+    fun `a day whose entire window is swallowed by a spring-forward gap is skipped like a holiday`() {
+        // London's spring-forward is at 01:00 - eats the window whole, rolls to next day
+        val scheduler = schedulerWithHolidays()
+        val txn = transaction(Market.GBR, LocalDateTime.parse("2026-03-28T10:00:00"))
+
+        val window = scheduler.findNextSendWindow(txn, now = Instant.parse("2026-03-28T00:00:00Z"))
+
+        assertEquals(Instant.parse("2026-03-30T00:00:00Z"), window.start) // 2026-03-29 skipped entirely
+        assertEquals(Instant.parse("2026-03-30T01:00:00Z"), window.end)
+    }
+
+    @Test
+    fun `a recorded till time that falls in a DST spring-forward gap does not blow up`() {
+        // real row from the fixture - recorded time sits in the gap, but we never
+        // resolve it to an Instant, so it just needs to roll past this day
+        val scheduler = schedulerWithHolidays()
+        val txn = transaction(Market.GBR, LocalDateTime.parse("2026-03-29T01:30:00"))
+
+        val window = scheduler.findNextSendWindow(txn, now = Instant.parse("2026-03-28T00:00:00Z"))
+
+        assertEquals(Instant.parse("2026-03-30T00:00:00Z"), window.start) // 2026-03-30T01:00 BST (+01:00)
+        assertEquals(Instant.parse("2026-03-30T01:00:00Z"), window.end)
+    }
+
+    @Test
+    fun `assumption check - java time resolves an ambiguous autumn 01-00 to the earlier offset`() {
+        // this is the raw library behaviour our window building relies on, pinned on its own
+        // so it's obvious what changes if a future JDK ever resolved overlaps differently.
+        val london = java.time.ZoneId.of("Europe/London")
+        val ambiguousStart = LocalDateTime.of(2026, 10, 25, 1, 0)
+
+        val resolved = ambiguousStart.atZone(london)
+
+        assertEquals(java.time.ZoneOffset.ofHours(1), resolved.offset) // BST - the first 01:00, not the second
+        assertEquals(Instant.parse("2026-10-25T00:00:00Z"), resolved.toInstant())
+    }
+
+    @Test
+    fun `a recorded till time that falls in a DST fall-back overlap does not blow up`() {
+        // real row from the fixture (GBR-0442-000006). this local time happens twice
+        // that day - we don't try to guess which one, just compare plain LocalTime
+        val scheduler = schedulerWithHolidays()
+        val txn = transaction(Market.GBR, LocalDateTime.parse("2026-10-25T01:30:00"))
+
+        val window = scheduler.findNextSendWindow(txn, now = Instant.parse("2026-10-24T00:00:00Z"))
+
+        // decided policy (see test above): window opens at the first 01:00 and closes at the
+        // one and only 02:00, so it's genuinely open for 2 real hours this day, not 1
+        assertEquals(Instant.parse("2026-10-25T00:00:00Z"), window.start) // 2026-10-25T01:00 BST (+01:00)
+        assertEquals(Instant.parse("2026-10-25T02:00:00Z"), window.end)   // 2026-10-25T02:00 GMT (+00:00)
+    }
+
+    // --- Defensive bound ---
+
+    @Test
+    fun `a holiday provider that never stops saying yes fails loudly instead of hanging`() {
+        val alwaysHoliday = object : org.example.holidays.HolidayProvider {
+            override fun isPublicHoliday(date: LocalDate, countryCode: String, subdivision: String?) = true
+        }
+        val scheduler = SendScheduler(alwaysHoliday)
+        val txn = transaction(Market.DEU, LocalDateTime.parse("2026-06-10T18:00:00"))
+
+        assertFailsWith<IllegalStateException> {
+            scheduler.findNextSendWindow(txn, now = Instant.parse("2026-06-10T00:00:00Z"))
+        }
+    }
+
 }

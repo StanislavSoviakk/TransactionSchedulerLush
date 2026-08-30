@@ -11,6 +11,10 @@ import java.time.Instant
 private val WINDOW_START = LocalTime.of(1, 0)
 private val WINDOW_END = LocalTime.of(2, 0)
 
+// safety net - real holiday runs are a few days, not years. if we ever hit this,
+// something upstream (holiday data) is broken, so fail loudly instead of hanging
+private const val MAX_LOOKAHEAD_DAYS = 3650L
+
 /**
  * Finds the earliest valid overnight window for an unsent transaction.
  *
@@ -29,19 +33,36 @@ class SendScheduler(
         now: Instant
     ): SendWindow {
         val zoneId = transaction.market.zoneId
+        val countryCode = transaction.market.countryCode
+        val subdivision = transaction.shopSubdivision
 
         var candidateDate = maxOf(
             earliestDateFromTransaction(transaction),
             earliestDateFromNow(now, zoneId)
         )
+        val giveUpAfter = candidateDate.plusDays(MAX_LOOKAHEAD_DAYS)
 
-        candidateDate = skipHolidays(
-            candidateDate = candidateDate,
-            countryCode = transaction.market.countryCode,
-            subdivision = transaction.shopSubdivision
-        )
+        while (true) {
+            if (candidateDate.isAfter(giveUpAfter)) {
+                throw IllegalStateException(
+                    "no valid send window found for ${transaction.id} within $MAX_LOOKAHEAD_DAYS days " +
+                            "of $candidateDate - likely a bad HolidayProvider"
+                )
+            }
 
-        return buildWindow(candidateDate, zoneId)
+            if (holidayProvider.isPublicHoliday(candidateDate, countryCode, subdivision)) {
+                candidateDate = candidateDate.plusDays(1)
+                continue
+            }
+
+            val window = tryBuildWindow(candidateDate, zoneId)
+            if (window != null) {
+                return window
+            }
+
+            // window didn't exist as a real local time today (see tryBuildWindow) - skip it
+            candidateDate = candidateDate.plusDays(1)
+        }
     }
 
     private fun earliestDateFromTransaction(
@@ -77,31 +98,15 @@ class SendScheduler(
         )
     }
 
-    private fun skipHolidays(
-        candidateDate: LocalDate,
-        countryCode: String,
-        subdivision: String?
-    ): LocalDate {
-        var date = candidateDate
-
-        while (
-            holidayProvider.isPublicHoliday(
-                date = date,
-                countryCode = countryCode,
-                subdivision = subdivision
-            )
-        ) {
-            date = date.plusDays(1)
-        }
-
-        return date
-    }
-
-
-    private fun buildWindow(
+    private fun tryBuildWindow(
         date: LocalDate,
         zoneId: ZoneId
-    ): SendWindow {
+    ): SendWindow? {
+        // on a fall-back day, 01:00 happens twice. atZone() picks the earlier
+        // occurrence by default, and we keep that: the window opens the moment the
+        // clock first reads 01:00 and closes at the single, unambiguous 02:00, so it
+        // stays open for 2 real hours that day instead of 1. Decided, not incidental -
+        // see the pinned assumption test in SendSchedulerTest.
         val start = date
             .atTime(WINDOW_START)
             .atZone(zoneId)
@@ -112,8 +117,10 @@ class SendScheduler(
             .atZone(zoneId)
             .toInstant()
 
-        check(start < end) {
-            "Send window start must be before its end"
+        // this happens when a spring-forward jump lands right on the window
+        // (e.g. London 01:00 -> 02:00) and swallows it whole - not a bug, just skip the day
+        if (start >= end) {
+            return null
         }
 
         return SendWindow(
