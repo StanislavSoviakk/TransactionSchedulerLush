@@ -11,21 +11,22 @@ import java.io.File
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import kotlin.system.exitProcess
 
 /**
  * Single entry point: reads a transactions CSV, works out the next valid send
  * window for every row, and prints one line per transaction.
  *
  * Usage: run with no args to use data/transactions.csv, or pass a path as arg 0.
- * See NOTES.md for the reasoning behind the fallbacks below.
+ * Trusted time / holiday data are required, not best-effort - see NOTES.md.
  */
 fun main(args: Array<String>) {
     val csvPath = args.getOrElse(0) { "data/transactions.csv" }
     val csvFile = File(csvPath)
 
-    if (!csvFile.exists()) {
+    if (!csvFile.isFile) {
         System.err.println("no such file: $csvPath")
-        return
+        exitProcess(1)
     }
 
     val parseResult = TransactionCsvParser.parse(csvFile.readLines())
@@ -36,10 +37,20 @@ fun main(args: Array<String>) {
         return
     }
 
-    val now = trustedNow()
+    val now = try {
+        trustedNow()
+    } catch (e: Exception) {
+        System.err.println("could not obtain a trusted current time (${e.javaClass.simpleName}: ${e.message}), aborting")
+        exitProcess(1)
+    }
     println("trusted now: $now")
 
-    val holidayProvider = buildHolidayProvider(parseResult.transactions, now)
+    val holidayProvider = try {
+        buildHolidayProvider(parseResult.transactions, now)
+    } catch (e: Exception) {
+        System.err.println("could not load public holiday data (${e.javaClass.simpleName}: ${e.message}), aborting")
+        exitProcess(1)
+    }
     val scheduler = SendScheduler(holidayProvider)
 
     println()
@@ -54,17 +65,14 @@ fun main(args: Array<String>) {
     }
 }
 
-// falls back to the system clock if the time server is unreachable - see NOTES.md
-private fun trustedNow(): Instant =
-    try {
-        HttpTimeProvider().now()
-    } catch (e: Exception) {
-        System.err.println("couldn't reach the time server (${e.javaClass.simpleName}: ${e.message}), falling back to the local clock")
-        Instant.now()
-    }
+// no fallback here on purpose - if we can't get a trusted time, we shouldn't
+// pretend the local clock is good enough. See NOTES.md.
+private fun trustedNow(): Instant = HttpTimeProvider().now()
 
 // fetches holidays for every year that could plausibly matter, not just "now" -
-// see NOTES.md (a till's own timestamp can be in any year, wrong clock and all)
+// see NOTES.md (a till's own timestamp can be in any year, wrong clock and all).
+// no fallback to "assume no holidays" if a fetch fails - an unknown holiday
+// calendar is not the same thing as an empty one.
 private fun buildHolidayProvider(transactions: List<Transaction>, now: Instant): HolidayProvider {
     val client = NagerDateClient()
     val countryCodes = transactions.map { it.market.countryCode }.toSet()
@@ -76,14 +84,7 @@ private fun buildHolidayProvider(transactions: List<Transaction>, now: Instant):
     val maxYear = (recordedYears + nowYear).max() + 1
 
     val holidays = countryCodes.flatMap { country ->
-        (minYear..maxYear).flatMap { year ->
-            try {
-                client.fetch(country, year)
-            } catch (e: Exception) {
-                System.err.println("couldn't fetch holidays for $country/$year (${e.javaClass.simpleName}: ${e.message}), treating as none known")
-                emptyList()
-            }
-        }
+        (minYear..maxYear).flatMap { year -> client.fetch(country, year) }
     }
 
     return InMemoryHolidayProvider(holidays)
