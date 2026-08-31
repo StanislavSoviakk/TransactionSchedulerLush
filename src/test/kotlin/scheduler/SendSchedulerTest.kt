@@ -227,6 +227,20 @@ class SendSchedulerTest {
     }
 
     @Test
+    fun `US spring-forward lands on a different date than the EU one, same gap-at-window-end shape`() {
+        // US spring-forward is the 2nd Sunday of March (2026-03-08), not the EU's last Sunday
+        // (2026-03-29, see the Berlin test above) - worth pinning separately so a fix for one
+        // market's DST dates can't accidentally assume the other market's calendar.
+        val scheduler = schedulerWithHolidays()
+        val txn = transaction(Market.USA, LocalDateTime.parse("2026-03-07T18:00:00"))
+
+        val window = scheduler.findNextSendWindow(txn, now = Instant.parse("2026-03-07T00:00:00Z"))
+
+        assertEquals(Instant.parse("2026-03-08T06:00:00Z"), window.start) // 01:00 EST (-05:00)
+        assertEquals(Instant.parse("2026-03-08T07:00:00Z"), window.end)   // resolved 03:00 EDT (-04:00)
+    }
+
+    @Test
     fun `market without DST keeps a stable offset across the year`() {
         val scheduler = schedulerWithHolidays()
         val txn = transaction(Market.JPN, LocalDateTime.parse("2026-06-10T18:00:00"))

@@ -93,4 +93,17 @@ class NagerDateClientTest {
             server.stop(0)
         }
     }
+
+    @Test
+    fun `malformed JSON fails loudly instead of returning garbage`() {
+        val (server, url) = stubServer("""this is not json""")
+
+        try {
+            kotlin.test.assertFails {
+                NagerDateClient(baseUrl = url).fetch("GB", 2026)
+            }
+        } finally {
+            server.stop(0)
+        }
+    }
 }
